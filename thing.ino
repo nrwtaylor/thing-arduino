@@ -1,9 +1,8 @@
 /*
 	Thing
  
- 	Connects an arduino to a SMS HAYES command set based modem.
- 	Responds to text messages with sensed and derivedinformation
-	about the Thing.
+ 	Provides a short text message interface to the Arduino with
+        four whitelisted numbers.
  
  	The circuit:
  	* I2C bus: Accelerometer, gyroscope, barometer, thermometer
@@ -13,17 +12,16 @@
  
  	Created 4 February 2019
  	By Nicholas Taylor
- 	Modified 19 February 2019
+ 	Modified 5 March 2019
  	By Nicholas Taylor
  
- 	Tutorial pending
+ 	http://url/of/online/tutorial.cc
  	http://stackr.ca
-
-	Edit this line to increase the incoming software serial buffer. 
-
- 	/usr/share/arduino/libraries/SoftwareSerial
- 	SoftwareSerial.h
- 	#define _SS_MAX_RX_BUFF 160 // RX buffer size
+ 
+        Note:
+        /usr/share/arduino/libraries/SoftwareSerial
+        SoftwareSerial.h
+        #define _SS_MAX_RX_BUFF 128 // RX buffer size
  
  */
 
@@ -31,11 +29,8 @@
 #include <DallasTemperature.h>
 
 #define ONE_WIRE_BUS 8
-
-// include the GSM library
-
 OneWire oneWire(ONE_WIRE_BUS);
-/********************************************************************/
+
 // Pass our oneWire reference to Dallas Temperature. 
 DallasTemperature sensors(&oneWire);
 
@@ -49,6 +44,9 @@ DallasTemperature sensors(&oneWire);
 #include <ADXL345.h>
 #include <HMC5883L.h>
 #include <Wire.h>
+
+//#include <EEPROM.h>
+#include <avr/wdt.h>
 
 Adafruit_BMP085 bmp;
 //L3G4200D gyroscope;
@@ -72,14 +70,14 @@ SoftwareSerial portSMS(10, 11);
 
 char charBuf[11]; // For number to text conversion
 
-char nom_from[12];
-
 char sms_serial_buffer[24]; //30>22
+
+char nom_from[12];
 char subject[10];
+
 char instruction[5];
 
 int sms_available_bytes = 0;
-
 const byte sms_serial_buffer_length = sizeof(sms_serial_buffer) - 1;
 
 char sms_whitelist[4][12] = {
@@ -87,6 +85,8 @@ char sms_whitelist[4][12] = {
   "XXXXXXXXXX",
   "XXXXXXXXXX",
   "XXXXXXXXXX"};
+
+const byte PROGMEM cron_hours = 4;
   
 const byte PROGMEM num_whitelist = sizeof(sms_whitelist) / sizeof(sms_whitelist[0]);
 
@@ -97,16 +97,12 @@ byte sms_pointer_read = 0;
 
 byte sms_budget = 0;
 const byte PROGMEM sms_budget_max = 1;
-
 byte sms_quota = 0;
-const byte PROGMEM sms_quota_max = 20; // Allow user to send up to N messages a minute
-
+const byte PROGMEM sms_quota_max = 3; // Allow user to send up to 3 messages a minute
 byte priority_quota = 0;
-const byte PROGMEM priority_quota_max = 1; // Allow user to send up to N priority messages per total bar count
-
+const byte PROGMEM priority_quota_max = 1; // Allow user to send up to 1 priority messages per 80 bar
 byte stack_quota = 0;
-const byte PROGMEM stack_quota_max = 2; // Allow user to send up to N priority messages per total bar count
-
+const byte PROGMEM stack_quota_max = 2; // Allow user to send up to 2 priority messages per 80 bar
 byte display_budget = 0;
 const byte PROGMEM display_budget_max = 1;
 
@@ -118,13 +114,15 @@ const byte PROGMEM bar_limit = 80 ;
 
 boolean flag_thing = false;
 
-char response[60]; //80
+char response[144]; //80
 
 char agent[16];
 char prior_agent[16];
 
 unsigned long current_millis = millis(); 
 unsigned long tick_millis = current_millis;
+
+unsigned long accelerometer_millis = current_millis;
 //unsigned long split_millis = millis();
 
 const int PROGMEM tick_interval = 100; // Crank up the tick
@@ -132,33 +130,64 @@ const int PROGMEM tick_interval = 100; // Crank up the tick
 const byte PROGMEM screenWidth = 16;
 const byte PROGMEM screenHeight = 2;
 
+//const static char uuid[] PROGMEM = "bf7c";
+const char uuid[] = "0000-0000-0000-0000-000000000000";
+const char nuuid[] = "0000";
+
 byte line0_index = 0;
 byte line1_index = 0;
 
 boolean flag_priority = false;
 boolean flag_cron = false;
 
-// Calculate Pitch, Roll and Yaw
+boolean state = false;
+
+// Initialise Pitch, Roll and Yaw
 float pitch = 0;
 float roll = 0;
 float yaw = 0;
 
 float heading;
 
-double fXg, fYg, fZg; 
+float voltage;
+float tesla;
+
+const float PROGMEM g = 9.81;
+
+float depth;
+
+// Initialize components of acceleration
+double fXg[2], fYg[2], fZg[2]; 
+float delta_t;
+
+double vX[2], vY[2], vZ[2];
+double sX[2], sY[2], sZ[2];
+
+float heave;
+float Z_e_peak = 0;
+float Z_e_peak_temp = 0;
+
+float cosRoll;
+float sinRoll;
+float cosPitch;
+float sinPitch;
 
 void setup()
 {
-
+  wdt_enable(WDTO_8S);
+  
+  lcd.begin(16,2);
+  lcd.backlight();//Power on the back light
+  
   // set up the serial console
   Serial.begin(4800);
   // Set up the connection to the modem
   portSMS.begin(9600);
 
   if (!bmp.begin()) {
-    Serial.println(F("Could not find a valid BMP085 sensor, check wiring!"));
-    while (1) {
-    }
+    //Serial.println(F("Could not find a valid BMP085 sensor, check wiring!"));
+    //while (1) {
+    //}
   }
 
   // Set scale 2000 dps and 400HZ Output data rate (cut-off 50)
@@ -174,38 +203,29 @@ void setup()
 
   accelerometer.begin();
 
-  lcd.begin(16,2);
-  lcd.backlight();//Power on the back light
+
 
   button.attachPress(doPress);
 
   sensors.begin(); 
 
+  // Send initial text messages.
+  // To first (primary) SMS number.
   strcpy(nom_from, sms_whitelist[0]);
   strcpy(agent, "start");
   strcpy(instruction, "+"); 
 
-  doBudget(); // Plus for stack
+  doBudget();
   doStart();
-  doMessage();
 
-  strcpy(nom_from, sms_whitelist[0]);
-  strcpy(agent, "kaiju");
-  strcpy(instruction, "+"); 
-
-  doBudget(); // Plus for stack
-  doKaiju();
-  doMessage();
+  strcpy(nom_from, "NULL"); 
   
-  strcpy(nom_from, "NULL");
-
-  strcpy(nom_from, sms_whitelist[0]);
   doTick();
-
 }
 
 void loop()
 { 
+  // Wonder if memory usage can be reduced.
   unsigned long current_millis = millis();
 
   button.tick();
@@ -226,50 +246,16 @@ void loop()
       //data[i] = Serial.read();
       Serial.read();
     }
-
   }
 
-*/
+  meep:
+  */
 
   if ((unsigned long)(current_millis - tick_millis) >= tick_interval) {
     doTick();
     tick_millis = current_millis;
   }
-
-}
-
-void doBuffer()
-{
-  Serial.print(F("Agent \"Buffer\" says "));
-  // Just prints it to Serial monitor for now.
-  Serial.print(F("sms_serial_buffer [ "));
-
-  for(int i=0; i<sms_serial_buffer_length; i++)
-  {
-    int fp = (sms_pointer_write - sms_serial_buffer_length + i) % (sms_serial_buffer_length);
-
-    if (!((sms_serial_buffer[fp] == 0xD) or (sms_serial_buffer[fp] == 0xA))) {
-      Serial.print(sms_serial_buffer[fp]);
-    }
-  }
-
-  Serial.print(F(" ] "));  
-
-  char* thisString = dtostrf(sms_pointer_write, 4, 0, charBuf);
-  Serial.print(F(" sms_pointer_write "));
-  Serial.print(deblank(thisString));
-
-  thisString = dtostrf(sms_pointer_read, 4, 0, charBuf);
-  Serial.print(F(" sms_pointer_read "));
-  Serial.print(deblank(thisString));  
-
-  thisString = dtostrf(sms_available_bytes, 4, 0, charBuf);
-  Serial.print(F(" sms_available_bytes "));
-  Serial.print(deblank(thisString)); 
-  Serial.print(F("/"));
-  Serial.print(_SS_MAX_RX_BUFF);
-  Serial.println();
-
+  wdt_reset();
 
 }
 
@@ -277,7 +263,6 @@ void doBuffer()
 int doMemory () {
   extern int __heap_start, *__brkval; 
   int v; 
-  //int memory;
   int memory = (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
 
   strcpy(response, ""); 
@@ -285,47 +270,61 @@ int doMemory () {
   dtostrf(memory, 5, 0, charBuf);
 
   strcat(response, deblank(charBuf));
-  strcat(response, " bytes available");
+  strcat(response, " bytes");
   
   strcpy(agent, "memory");
   return memory;
 }
 
-
 void doStart()
 {
+  byte stored_state = EEPROM.read(7);
+
+  // 255 no reading saved. Or failed.
+  if (stored_state == 255) {state = false;}
+  if (stored_state == 0) {state = true;EEPROM.write(7,255);}
+
   portSMS.print(F("AT"));
   portSMS.write(0x0D);  // Carriage Return in Hex
   portSMS.write(0x0A);  // Line feed in Hex
 
-  doOK();
-
   portSMS.print(F("AT+CMGF=1"));
   portSMS.write(0x0D);  // Carriage Return in Hex
   portSMS.write(0x0A);  // Line feed in Hex
-  //Serial.println("Sending SMS");
-  doOK();
-  
-  //  delay(1500);
-  strcpy(response, "Started.");
+
+  if (state) {
+    strcpy(response, "Started.");
+  } else {
+    strcpy(response, "Squawk.");
+  }
 
   if (strstr(agent, "start")) {
-    doSMS();
+    doMessage();
   }
 
   strcpy(agent, "start");
-
 }
 
 void doKaiju()
 {
-  doAccelerometer();
-  if (bar == 0) {strcpy(response, "Hello.");}
+  if (bar == 0) {strcpy(response, "Started.");}
+  if (bar == 21) {strcpy(response, "Looped.");}
   
   if (strstr(agent, "kaiju")) {
-    doSMS();
+    doMessage();
   }
   strcpy(agent, "kaiju");
+}
+
+void doUuid()
+{
+  strcpy(response, "");
+  strcat(response, uuid);
+  
+  if (strstr(agent, "uuid")) {
+    doMessage();
+  }
+  strcpy(agent, "uuid");
 }
 
 void doEngine()
@@ -340,10 +339,55 @@ void doEngine()
   strcat(response, "C");
   
   if (strstr(agent,"engine")) {
-    doSMS();
+    doMessage();
   }
   
   strcpy(agent, "engine");
+}
+
+void doThing()
+{
+  strcpy(response, ""); 
+
+  strcat(response, nuuid);
+  strcat(response, " ");
+  
+  numberChar(voltage, 5, 2);
+    
+  strcat(response, "V ");
+  
+  float temperature = bmp.readTemperature();  
+  dtostrf(temperature, 5, 1, charBuf);
+  strcat(response, deblank(charBuf));
+  strcat(response, "C ");
+  
+  float pressure = bmp.readPressure();
+  numberChar(pressure, 7, 0);
+  strcat(response, "Pa ");
+   
+  numberChar(tesla / (10000/1000), 5, 2); 
+  strcat(response, "uT ");
+  
+  numberChar(Z_e_peak, 5, 2); 
+  strcat(response, "g");
+  
+  sensors.requestTemperatures();
+  for (int i = 0; i < 3; i++) {
+    strcat(response, " ");
+    temperature = sensors.getTempCByIndex(i);
+    numberChar(temperature, 5, 1);
+    strcat(response, "C"); 
+  }
+
+  strcat(response, " ");    
+  numberChar(depth, 5, 0);
+  strcat(response, "mm");
+
+  if (strstr(agent,"thing")) {
+    doMessage();
+  }
+  
+  strcpy(agent, "thing");
 }
 
 void doCockpit()
@@ -352,27 +396,20 @@ void doCockpit()
   float temperature = sensors.getTempCByIndex(0);
 
   strcpy(response, ""); 
-
-  dtostrf(temperature, 5, 1, charBuf);
-
-  strcat(response, deblank(charBuf));
+  
+  numberChar(temperature, 5, 1); 
   strcat(response, "C");      
 
-  float roll_degrees = roll * 180 / M_PI;
-  dtostrf(roll_degrees, 4, 0, charBuf);
   strcat(response, " roll ");
-  strcat(response, deblank(charBuf));
-  strcat(response, "");
+  numberChar(roll * 180 / M_PI, 4, 0);
 
-  float heading_degrees = heading * 180/M_PI;
+  strcat(response, " ");
   
-  char* thisString = dtostrf(heading_degrees, 4, 0, charBuf);
-  strcat(response, " compass ");
-  strcat(response, deblank(thisString));
-  strcat(response, " mag");
-
+  numberChar(heading * 180/M_PI, 4, 0);
+  strcat(response, "M");
+  
   if (strstr(agent,"cockpit")) {
-    doSMS();
+    doMessage();
   } 
   
   strcpy(agent, "cockpit");
@@ -381,9 +418,9 @@ void doCockpit()
 void doRoll()
 {
   strcpy(response, "");      
-  dtostrf(roll * 180 / M_PI, 4, 0, charBuf);
-  strcat(response, deblank(charBuf));
-  strcat(response, " degrees ");
+ 
+  numberChar(roll * 180 / M_PI, 4, 0);
+  strcat(response, " degrees");
   
   strcpy(agent, "roll");
 }
@@ -391,33 +428,67 @@ void doRoll()
 void doPitch()
 {
   strcpy(response, "");      
-  dtostrf(pitch * 180 / M_PI, 4, 0, charBuf);
-  strcat(response, deblank(charBuf));
+  
+  numberChar(pitch * 180 / M_PI, 4, 0);
   strcat(response, " degrees");
   
-  strcpy(agent, "roll");
+  strcpy(agent, "pitch");
 }
 
 void doCabin()
 {
-  float temperature = bmp.readTemperature();
+  sensors.requestTemperatures();
+  float temperature = sensors.getTempCByIndex(2);
+  strcpy(response, ""); 
 
-  strcpy(response, "");      
-  dtostrf(temperature, 5, 1, charBuf);
-  strcat(response, deblank(charBuf));
+  numberChar(temperature, 5, 1);
+
   strcat(response, "C");
   
   if (strstr(agent,"cabin")) {
-    doSMS();
+    doMessage();
   }
+  
   strcpy(agent, "cabin");
+}
+
+void doHeave()
+{
+  // Identify the peak vertical acceleration in the period.
+  // Approximation metric for 'choppiness'.
+  if ((bar % 5 == 0) and (ticks == 0)) {
+    Z_e_peak = Z_e_peak_temp;
+    Z_e_peak_temp = 0;
+  }
+ 
+  float a3 = -1 * sinPitch;
+  float b3 = sinRoll * cosPitch;
+  float c3 = cosRoll * cosPitch;
+//  float Z_e = g * (1 - (a3*fXg[0]+b3*fYg[0]+c3*fZg[0]));
+
+  float Z_e = (1 - (a3*fXg[0]+b3*fYg[0]+c3*fZg[0]));  
+ 
+   if (Z_e < 0) {Z_e = -1 * Z_e;}
+ 
+  if (Z_e > Z_e_peak_temp) {Z_e_peak_temp = Z_e;}
+  
+  strcpy(response, "");
+  numberChar(Z_e_peak, 7, 2); 
+  strcat(response, "g");
+ 
+  if (strstr(agent,"heave")) {
+    doMessage();
+  } 
+  
+  strcpy(agent, "heave"); 
+  
 }
 
 boolean doPriority()
 {
   strcpy(agent, "priority");
 
-  if ( doBilge()  ) {  
+  if ( doBilge() or doVoltage() ) {  
     // Turn off the flag
     append(response, "PRIORITY ", 0);
     // Allow one PRIORITY message to be sent on toggle.    
@@ -466,25 +537,38 @@ void append(char subject[], const char insert[], int pos) {
 
 void doSMS()
 {
-
+  boolean do_not_send = false;
+  
   if (sms_budget <= 0) {
-    return;
+    do_not_send = true;
   }
 
   if (sms_quota >= sms_quota_max) {
-    return;
+    do_not_send = true;
   }
   
   boolean match = false;
   for (int i = 0; i < num_whitelist; i++) {
     if (strstr(nom_from, sms_whitelist[i])) {match = true;}
   }
-  if (!match) {return;}
+
+  if (!match) {
+    do_not_send = true;
+  }
   
   if ((stack_quota >= stack_quota_max) and (strstr(nom_from, sms_whitelist[1]))) {
+	// quota for stack messages exceeded
+    do_not_send = true;
+  }
+  
+  if (do_not_send) {
+    strcpy(nom_from, "NULL");
+    strcpy(instruction, "-");
+    doBudget();
     return;
   }
 
+  // Authorized to send an SMS
   portSMS.print(F("AT+CMGS=\""));
 
   portSMS.print(nom_from);
@@ -508,8 +592,7 @@ void doSMS()
   portSMS.write(0x0D);  // Carriage Return in Hex
   portSMS.write(0x0A);  // Line feed in Hex
 
-  delay(5000); // Might be able to reduce this.
-  // Blocks for 5 seconds.
+  delay(500); // Test.
 
   // At this point an SMS has been sent.
   // Debit the thing account.
@@ -518,11 +601,6 @@ void doSMS()
 
   doQuota();
 
-  Serial.print(F("Agent \"SMS\" says, \""));
-  Serial.print(response);
-  Serial.print(F("\""));
-  Serial.println();
-
   strcpy(response, "");     
   strcat(response, "Sent.");
 
@@ -530,7 +608,7 @@ void doSMS()
   flag_priority = false;
   
   strcpy(agent, "sms"); 
-  strcpy(nom_from, NULL); 
+  strcpy(nom_from, "NULL"); 
 
 }
 
@@ -552,11 +630,9 @@ void doIndex(int index)
     doEngine();
     break;
   case 3:
-    doTesla();
-    break;
-  case 4:
     doCabin();
     break;
+  case 4:
   case 5:
     doAccelerometer();
     break;
@@ -564,7 +640,11 @@ void doIndex(int index)
     doCompass();
     break;
   case 7:
+    doVoltage();
+    break;
   case 8:
+    doTesla();
+    break;
   case 9:
   case 10:
     // Run Cockpit for 4 bars.
@@ -591,12 +671,12 @@ void doIndex(int index)
     doMemory();
     break; 
   case 20:
-    doClocktime();
+    doClock();
     break;   
   case 21:
+  	if (EEPROM.read(7) == 255) {EEPROM.write(7,0);}
     doBar();
     break;  
-
   default:
     // statements
     break;
@@ -618,30 +698,53 @@ void doAgent()
   doIndex(index);
 }
 
-void doScience()
+
+boolean doVoltage()
 {
-  doAccelerometer();
-  /*
-  doTesla();
+
+  int bl = false;
+  // Tailoring.
+  int max = 1023;
+  int max_measurement = 23.05;
+  int min = 0;
+  int min_measurement = 0;
   
-  if (strstr(agent,"science")) {
-    doSMS();
-  }
+  // Read the sensor.  
+  int sensorValue = analogRead(A1);
+  //Serial.println(sensorValue);
   
-  strcpy(agent, "science");
-*/
+  voltage = min_measurement + float (max_measurement - min_measurement) * (float (sensorValue - min) / float(max-min));
+
+  strcpy(response, "");
+  numberChar(voltage, 5, 2); 
+  strcat(response, "V");
+  
+  if (voltage < 0) {
+    strcpy(response, "X");
+  } 
+
+  if (voltage <= 11.50) {  
+    flag_priority = true;
+    bl = true;
+  }  
+
+  if (strstr(agent,"voltage")) {
+    doMessage();
+  } 
+
+  strcpy(agent, "voltage");
+    
+  return bl;
 }
 
-
-void doTest() {
-}
 
 void doTemperature()
 {
   float temperature = bmp.readTemperature();
-  dtostrf(temperature, 7, 2, charBuf);
+
   strcpy(response, "");
-  strcat(response, deblank(charBuf));
+
+  numberChar(temperature, 7, 2);  
   strcat(response, "C");
   
   strcpy(agent, "temperature"); 
@@ -652,19 +755,18 @@ void doWeather()
   sensors.requestTemperatures();
   float number = sensors.getTempCByIndex(0);
 
-  dtostrf(number, 5, 1, charBuf);
   strcpy(response, "");
-  strcat(response, deblank(charBuf));
+  numberChar(number, 5, 1);
+  
   strcat(response, "C ");
 
-  number = bmp.readPressure();
+  float pressure = bmp.readPressure();
+  numberChar(pressure/100, 7, 0);
 
-  dtostrf(number, 7, 0, charBuf);
-  strcat(response, deblank(charBuf));
-  strcat(response, "Pa " );
+  strcat(response, "mbar " );
   
   if (strstr(agent,"weather")) {
-    doSMS();
+    doMessage();
   } 
   
   strcpy(agent, "weather"); 
@@ -703,73 +805,74 @@ void doGyro()
  strcat(response, deblank(charBuf)); 
  }
  */
+
+ 
 void doAccelerometer() {
   const float alpha = 0.5;
 
   double Xg, Yg, Zg;
   accelerometer.read(&Xg, &Yg, &Zg);
+  
+  delta_t = (millis() - accelerometer_millis) / 1000;
+  accelerometer_millis = millis();
 
   //Low Pass Filter
-  fXg = Xg * alpha + (fXg * (1.0 - alpha));
-  fYg = Yg * alpha + (fYg * (1.0 - alpha));
-  fZg = Zg * alpha + (fZg * (1.0 - alpha));
+  fXg[0] = Xg * alpha + (fXg[0] * (1.0 - alpha));
+  fYg[0] = Yg * alpha + (fYg[0] * (1.0 - alpha));
+  fZg[0] = Zg * alpha + (fZg[0] * (1.0 - alpha));
   
   //Roll & Pitch Equations
-  roll  = atan2(fYg, fZg);
-  //roll  = atan2(fYg, -fZg);
-  pitch = atan2(fXg, sqrt(fYg*fYg + fZg*fZg));
+  roll  = atan2(fYg[0], fZg[0]);
+  pitch = atan2(fXg[0], sqrt(fYg[0]*fYg[0] + fZg[0]*fZg[0]));
+  
+  cosRoll = cos(roll);
+  sinRoll = sin(roll);
+  cosPitch = cos(pitch);
+  sinPitch = sin(pitch);
   
   yaw = heading + PI; // Does this belong here.
-
- /*
-  if (yaw < 0) { 
-    yaw += 2 * PI; 
-  }
-  if (yaw > 2 * PI) { 
-    yaw -= 2 * PI; 
-  }
-*/
+  yaw = reduceDirection(yaw);
+  
+  doHeave();
   
   strcpy(response, ""); 
 
-  char* thisString = dtostrf(Xg, 5, 3, charBuf);
-  strcat(response, thisString);
+  numberChar(fXg[0], 5, 2);
+  strcat(response, "g ");
 
-  strcat(response, " ");
-
-  thisString = dtostrf(Yg, 5, 3, charBuf);
-  strcat(response, thisString);
-
-  strcat(response, " ");
-
-  thisString = dtostrf(Zg, 5, 3, charBuf);
-  strcat(response, thisString);
-
-  strcat(response, " ");
-
-  thisString = dtostrf(roll*180.0/M_PI, 5, 3, charBuf);
-  strcat(response, thisString);
-
-  strcat(response, " ");
-
-  thisString = dtostrf(pitch*180.0/M_PI, 5, 3, charBuf);
-  strcat(response, thisString); 
- /* 
-  strcat(response, " ");
-
-  thisString = dtostrf(yaw*180.0/M_PI, 5, 3, charBuf);
-  strcat(response, thisString); 
- */ 
-  strcpy(agent, "accelerometer");
+  numberChar(fYg[0], 5, 2);
+  strcat(response, "g ");
   
+  numberChar(fZg[0], 5, 2);
+  strcat(response, "g ");
+  
+  numberChar(Z_e_peak, 5, 2);
+  strcat(response, "g ");
+
+  numberChar(roll*180.0/M_PI, 5, 2);
+  strcat(response, " ");
+
+  numberChar(pitch*180.0/M_PI, 5, 2);
+  strcat(response, " ");
+
+  numberChar(yaw*180.0/M_PI, 5, 2);
+ 
+  strcpy(agent, "accelerometer");
+  doSerial();  
+}
+
+void numberChar(float number, int digits, int precision)
+{
+  char* thisString = dtostrf(number, digits, precision, charBuf);
+  strcat(response, deblank(thisString));
 }
 
 void doPressure()
 {
   float pressure = bmp.readPressure();
-  dtostrf(pressure, 7, 0, charBuf);
-  strcpy(response, "");
-  strcat(response, deblank(charBuf));
+  
+  numberChar(pressure, 5, 0);
+  
   strcat(response, "Pa");
   
   strcpy(agent, "pressure");
@@ -777,10 +880,11 @@ void doPressure()
 
 void doAgents()
 {
-  strcpy(response, "Ping / Weather / Cockpit / Cabin / Bilge / Crow"); 
+  strcpy(response, "");
+  strcat(response, "Weather / Cockpit / Bilge / Cabin / Engine"); 
 
   if (strstr(agent,"agents")) {
-    doSMS();
+    doMessage();
   } 
   strcpy(agent, "agents");
 }
@@ -789,178 +893,93 @@ void doMessage()
 {
   doSerial();   
   doDisplay();  
-  doSMS();   
-}
-
-void doSubject()
-{
- strcpy(subject, "Hello."); 
-  
+  doSMS();  
 }
 
 void doCrow()
 {
-  strcpy(response, "Awk.");
-
- 
   if (strstr(agent,"crow")) {
-    doSMS();
+    //boolean match = false;
+    for (int i = 0; i < num_whitelist; i++) {
+      strcpy(nom_from, sms_whitelist[i]);
+      
+      strcpy(instruction, "+");
+      doBudget();
+      strcpy(response, "Awk.");
+      strcpy(agent, "corvid");
+      doMessage();
+    }
   } 
   strcpy(agent, "crow");
   
 }
-/*
-void doPigeon()
-{
-  strcpy(response, "PIGEON | ");
-  strcat(response, "Coo.");
 
- 
-  if (strstr(agent,"pigeon")) {
-    doSMS();
-  } 
-  strcpy(agent, "pigeon");
-  
-}
-*/
-/*
-void doSeagull()
-{
-  strcpy(response, "SEAGULL | ");
-  strcat(response, "Squawk.");
-
- 
-  if (strstr(agent,"seagull")) {
-    doSMS();
-  } 
-  strcpy(agent, "seagull");
-  
-}
-*/
 void doSerial()
 {   
-  Serial.println();
-
-  Serial.print(millis());
-  Serial.print(F("ms "));
-
-  Serial.print(F("sms_quota "));
-  Serial.print(sms_quota);
-  Serial.print(F("/"));
-  Serial.print(sms_quota_max);
-
-  Serial.print(F(" sms_budget "));
-  Serial.print(sms_budget);
-  
-  Serial.print(F(" sms_available_bytes "));
-  Serial.print(sms_available_bytes);
-  
-  Serial.println();
-
-  Serial.print(F("display_budget "));
-  Serial.print(display_budget);
-
-  Serial.print(F(" flag_priority "));
-  Serial.print(flag_priority);
-  
-  Serial.println();
-
-  Serial.print(F("bar "));
-  Serial.print(bar);
-
-  Serial.print(F(" subject "));
-  Serial.print(subject);
-
-  Serial.print(F(" nom_from "));
-  Serial.print(nom_from);
-
-  Serial.print(F(" agent "));
-  Serial.print(agent);
-
-  Serial.println();
-
-  doBuffer();
-
-  Serial.println();
-
-  Serial.print(F(""));
-  Serial.print(response);
-
-  Serial.println();
-
-  Serial.println();   
+  Serial.print(strupr(agent));
+  Serial.print(" | ");
+  Serial.println(response);
 }
 
 void doTesla()
 {
   MagnetometerScaled scaled = compass.readScaledAxis(); //
 
-  //float milli_gauss = sqrt(scaled.XAxis * scaled.XAxis + scaled.YAxis * scaled.YAxis + scaled.ZAxis * scaled.ZAxis);
-  float nano_tesla = sqrt(scaled.XAxis * scaled.XAxis + scaled.YAxis * scaled.YAxis + scaled.ZAxis * scaled.ZAxis) / (10000/(1000));
+  tesla = sqrt(scaled.XAxis * scaled.XAxis + scaled.YAxis * scaled.YAxis + scaled.ZAxis * scaled.ZAxis);
 
-  char* thisString = dtostrf(nano_tesla, 9, 3, charBuf);
-  strcpy(response, "");
-  strcat(response, deblank(thisString));
+  strcpy(response, "");  
+  numberChar(tesla / (10), 5, 2);
   strcat(response, "uT");
 
-  if (nano_tesla >= 80) {  
+  if (tesla >= 80 / (10000/1000)) {  
     flag_priority = true; 
   }
   
-    strcpy(agent, "tesla");
+  strcpy(agent, "tesla");
 }
+
+float reduceDirection(float direction)
+{
+
+  if (direction < 0) { 
+    direction += 2 * PI; 
+  }
+  if (direction > 2 * PI) { 
+    direction -= 2 * PI; 
+  }  
+  return direction;
+}
+
 
 void doCompass()
 {
-  // Retrived the scaled values from the compass (scaled to the configured scale).
+  // Retreive the scaled values from the compass (scaled to the configured scale).
   MagnetometerScaled scaled = compass.readScaledAxis(); //
 
-  float cosRoll = cos(roll);
-  float sinRoll = sin(roll);
-  float cosPitch = cos(pitch);
-  float sinPitch = sin(pitch); 
-
   // Tilt compensation
-  // Test
   float Xh = scaled.XAxis * cosPitch + scaled.ZAxis * sinPitch; //XAxis
   float Yh = scaled.XAxis * sinRoll * sinPitch + scaled.YAxis * cosRoll - scaled.ZAxis * sinRoll * cosPitch; //YAxis
   
-
-  heading = atan2(Yh, Xh);
-  
-  if (heading < 0) { 
-    heading += 2 * PI; 
-  }
-  if (heading > 2 * PI) { 
-    heading -= 2 * PI; 
-  }
+  heading = atan2(Yh, Xh); 
+  heading = reduceDirection(heading);
 
   float heading_degrees = heading * 180/M_PI;
 
-  char* thisString = dtostrf(heading_degrees, 4, 0, charBuf);
   strcpy(response, "");
-  strcat(response, deblank(thisString));
-  strcat(response, " MAGNETIC");
+  numberChar(heading_degrees, 4, 0);
+  strcat(response, "M");
 
   float heading_true = (int (heading_degrees + 16.09) % 359);
 
-  thisString = dtostrf(heading_true, 4, 0, charBuf);
   strcat(response, " ");
-  strcat(response, deblank(thisString));
-  strcat(response, " TRUE");
+  numberChar(heading_true, 4, 0);
+  strcat(response, "T");
   
   strcpy(agent, "compass");
 }
 
 boolean doBudget()
 {
-  Serial.print(F("Agent \"Budget\" says, \""));
-  Serial.print(sms_budget);
-  Serial.print(F("/"));
-  Serial.print(sms_budget_max);
-  Serial.print(F("\""));
-  Serial.println();
-  
   if (strstr(instruction,"+")) {
     ++sms_budget;
     if (sms_budget >= sms_budget_max) {
@@ -989,13 +1008,6 @@ boolean doBudget()
 
 boolean doQuota()
 {
-  Serial.print(F("Agent \"Quota\" says, \""));
-  Serial.print(sms_quota);
-  Serial.print(F("/"));
-  Serial.print(sms_quota_max);
-  Serial.print(F("\""));
-  Serial.println();
-
   if (strstr(instruction,"R")) {
     sms_quota = 0;
   } 
@@ -1017,24 +1029,11 @@ void doPress()
   doBudget();
 
   strcpy(response, "");
-  strcat(response, "Button pressed.");
+  strcat(response, "Pressed.");
   strcpy(agent, "press");
 }
 
-/*
-void doSelect()
-{
-  strcpy(response, "SELECT | ");
-  strcat(response, "Selected.");
-}
-
-void doSignal(int signal_number)
-{
-
-}
-*/
 // Character and character string manipulation help.
-
 char * charPad(char* str){
   for(int i = 0; i < (15 - sizeof(str)); i++) {
     strcat(str, " "); 
@@ -1068,40 +1067,29 @@ char* booleanChar(boolean var) {
 }
 
 void doFlag() {
-  Serial.print(F("Agent \"Flag\" says, \""));
   strcpy(response, "");
 
   flag_thing = doOK();
 
   if (flag_thing) {
     strcat(response, "Red.");
-    Serial.print(F("Red."));    
   } 
   else {
     strcat(response, "Green.");
-    Serial.print(F("Green"));
   }
 
-  Serial.print(F("\""));
-  Serial.println();
-
   if (strstr(agent,"flag")) {
-    doSMS();
+    doMessage();
   }
   
   strcpy(agent, "flag");
-
 }
 
-/*
-void doProgram(int number) {
-}
-*/
+
 boolean randomBoolean()
 {
   long randNumber = random(0,255);
-  //Serial.print(randNumber);
-  //Serial.println();
+
   if (randNumber > 128) {
     return true;
   } 
@@ -1158,9 +1146,6 @@ void doDisplay()
 
   char * line[2];
 
-  // String splitting on vertical bar.
-  //line[0] = subStr(response, "|", 1);
-  //line[1] = subStr(response, "|", 2);
   line[0] = strupr(agent);
   line[1] = response;
 
@@ -1196,23 +1181,20 @@ char* depad(char* input)
   output[j]=0;
   return output;
 }
-// https://stackoverflow.com/questions/9072320/split-string-into-string-array
 
+// https://stackoverflow.com/questions/9072320/split-string-into-string-array
 void doTick()
 {
+
   doAccelerometer();
   doCompass();
+  doTesla();
   
-  Serial.print(F("Agent \"Tick\" counts "));
-  Serial.print(ticks);
-  Serial.print(F("."));
-  Serial.println();
+  strcpy(response, "tick "); 
+  numberChar(ticks, 5, 0);
   
   ticks++;
-
-  char* thisString = dtostrf(bar, 4, 0, charBuf);
-  strcpy(response, "");
-  strcat(response, "Ticked.");
+ 
 
   if (ticks>tick_limit) {
     ticks = 0;
@@ -1227,29 +1209,19 @@ void doTick()
 
 void doPing()
 {
-  Serial.print(F("Agent \"Ping\" says, \"Hello.\""));
-  Serial.print(agent);
-  Serial.println();
 
   strcpy(response, "");
   strcat(response, "Pong.");
 
   if (strstr(agent,"ping")) {
-    doSMS();
+    doMessage();
   }  
 
   strcpy(agent, "ping");
+
 }
 
-void doPong()
-{
-  strcpy(response, "");
-  strcat(response, "Ping.");
- 
-   strcpy(agent, "pong"); 
-}
-
-void doClocktime()
+void doClock()
 { 
   char timestr[9];
   timestr[0] = '0' + hour() / 10;
@@ -1265,7 +1237,7 @@ void doClocktime()
   strcpy(response,"");
   strcat(response, deblank(timestr)); 
 
-  strcpy(agent, "clocktime"); 
+  strcpy(agent, "clock"); 
 }
 
 void doBar()
@@ -1276,12 +1248,7 @@ void doBar()
     bar = 0;
   }
 
-  dtostrf(bar, 5, 0, charBuf);
-  strcpy(response, "");
-
-  strcat(response, "BAR | ");
-  strcat(response, deblank(charBuf));
-
+  numberChar(bar, 5, 0);
 
   doCron(); // Check the clock each and every bar.  Minimum.
 
@@ -1292,32 +1259,33 @@ void doBar()
 boolean doBilge()
 {
   int bl = false;
-  // Vessel tailoring.
+  // Tailoring.
   int max = 935;
   int max_measurement = 350 + 75;
+  // 38,39 at bottom jumps to 595
   int min = 595;
   int min_measurement = 75;
 
   // Read the sensor.  
   int sensorValue = analogRead(A0);
-  float depth = min_measurement + float (max_measurement - min_measurement) * (float (sensorValue - min) / float(max-min));
-
-  dtostrf(depth, 5, 0, charBuf);
-  if (depth < 0) {
-    strcpy(charBuf, "<75");
-  } 
+  depth = min_measurement + float (max_measurement - min_measurement) * (float (sensorValue - min) / float(max-min));
 
   strcpy(response, "");
+  numberChar(depth, 5, 0); 
+
+  if (depth < 0) {
+    depth = 0;
+    strcpy(response, "<75");
+  } 
+  strcat(response, "mm");
+  
   if (depth >= 400) {  
     flag_priority = true;
     bl = true;
   }  
-  strcat(response, "");
-  strcat(response, deblank(charBuf));
-  strcat(response, "mm");
 
   if (strstr(agent,"bilge")) {
-    doSMS();
+    doMessage();
   } 
 
   strcpy(agent, "bilge");
@@ -1331,36 +1299,37 @@ void doForget()
   portSMS.println("AT+CMGD=0,4");
 
   strcpy(response, "");     
-  strcat(response, "All messages forgotten.");
+  strcat(response, "Forgot messages.");
   
   strcpy(agent, "forget");
 }
 
 void doHayes()
 {
+
   if (strstr(agent,"AT")) {
     strcpy(response, "OK");
   }
 
   if (strstr(agent,"ATI")) {
-    strcpy(response, "This is a Thing.");
+    strcpy(response, "OK");
   }
 
   if (strstr(agent,">")) {
     portSMS.print(response);  //SMS body
     delay(500);
     portSMS.write(0x1A);  // sends ctrl+z end of message
-    // portSMS.write(0x0D);  // Carriage Return in Hex
-    // portSMS.write(0x0A);  // Line feed in Hex
     portSMS.println();
-    delay(5000);
+    delay(500);
   }
+
 
   if (strstr(agent,"+CMTI")) {
     int number = 0;
     int n = 0;
     int fp = 0;
-    strcpy(response, "SMS received.");
+
+    strcpy(response, "Received.");
     strcpy(instruction, "+");
     doBudget();
 
@@ -1370,15 +1339,13 @@ void doHayes()
     portSMS.print(F("AT+CMGR="));
     portSMS.print(number);
     portSMS.write(0x0D);  // Carriage Return in Hex
-    //portSMS.write(0x0A);  // Line feed in Hex
 
     if (isAgent()) {
-      //Serial.println(F("HAYES"));
     }        
   }
 
   if (strstr(agent,"+SMS FULL")) {
-    strcpy(response, "SMS Full. PRIORITY.");
+    strcpy(response, "SMS Full.");
     strcpy(instruction, "+");
     doForget();
   }
@@ -1392,24 +1359,15 @@ int doNumber()
   unsigned long sms_millis = millis();  
   boolean flag = false;
   int fp = sms_pointer_write;
-  while ((unsigned long)(millis() - sms_millis) <= 10000) { // Listen to the buffer 10000
+  while ((unsigned long)(millis() - sms_millis) <= 2000) { // Listen to the buffer 10000
     doHear();
-    //doRead(); // Listen for another char
+
     fp = (fp + 1) % (sms_serial_buffer_length);
 
-    Serial.print(F("sms_serial_buffer["));
-    Serial.print(fp);    
-    Serial.print(F("] = "));
-    Serial.print(sms_serial_buffer[fp]);
-    Serial.println();
-
     if (isDigit(sms_serial_buffer[fp])){
-
       flag = true;
-
       int digit = sms_serial_buffer[fp] - '0';
       number = 10 * number + digit ;
-      //++n;
     }
 
     if ((flag == true) and ( (isSpace(sms_serial_buffer[fp])) or (sms_serial_buffer[fp]== 88))) {
@@ -1418,6 +1376,15 @@ int doNumber()
   }
 
   return NULL;
+}
+
+boolean isHit()
+{
+  if (doListen()) {
+    doRespond();
+    return true;  
+  }  
+  return false;
 }
 
 boolean isAgent()
@@ -1431,106 +1398,60 @@ boolean isAgent()
   while ((unsigned long)(millis() - sms_millis) <= 2000) { // Listen to the buffer 2000
     button.tick();
     doHear();
-  
+    
     for (int i = 0; i < num_whitelist; i++) {
       strcpy(search_for, sms_whitelist[i]);
+
       if (doListen()) {
         doRespond(); 
       }
+
     }
   
     strcpy(search_for, "+CMTI");
-    if (doListen()) {
-      doRespond(); 
-    }
+    if (isHit()) {return true;}
 
     strcpy(search_for, "+SMS FULL");
-    if (doListen()) {
-      doRespond(); 
-    }
-
+    if (isHit()) {return true;}
+  
     strcpy(search_for, "ping");
-    if (doListen()) {
-      doRespond();
-      return true;
-    }
+    if (isHit()) {return true;}
 
     strcpy(search_for, "bilge");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    }    
-    
+    if (isHit()) {return true;}
+
     strcpy(search_for, "weather");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    }  
+    if (isHit()) {return true;}
 
     strcpy(search_for, "cockpit");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    }   
+    if (isHit()) {return true;}
 
     strcpy(search_for, "cabin");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    }   
-
+    if (isHit()) {return true;}
+  
     strcpy(search_for, "crow");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    } 
+    if (isHit()) {return true;}
        
     strcpy(search_for, "engine");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    } 
+    if (isHit()) {return true;}
 
-/*   
-    strcpy(search_for, "science");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    }
-*/
-
-/*    
-    strcpy(search_for, "pigeon");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    } 
-    
-    strcpy(search_for, "seagull");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    } 
-*/   
     strcpy(search_for, "flag");
-    if (doListen()) {
-      doRespond();
-      return true;  
-    }  
+    if (isHit()) {return true;}
 
     strcpy(search_for, "kaiju");    
-    if (doListen()) {
-      doRespond();
-      return true;  
-    } 
+    if (isHit()) {return true;}
     
-/*   
-    strcpy(search_for, "agents");    
-    if (doListen()) {
-      doRespond();
-      return true;  
-    } 
-*/
+    strcpy(search_for, "thing");    
+    if (isHit()) {return true;}
+
+    strcpy(search_for, "agents");
+    if (isHit()) {return true;}
+
+    strcpy(search_for, "uuid");
+    if (isHit()) {return true;}
+    
+    strcpy(search_for, "heave");
+    if (isHit()) {return true;}
 
   }
 
@@ -1546,33 +1467,38 @@ void doStatus()
 }
 
 void doCron()
-{   
-  
-  if ( (minute() == 2) and (flag_cron == false)) {
-    Serial.print(F("Agent \"Cron\" triggered."));
+{  
+   
+  if ( (hour() % cron_hours == 0) and (flag_cron == false)) { 
     strcpy(instruction, "+"); 
-    doBudget();
+    doBudget(); 
     strcpy(nom_from,sms_whitelist[1]);
     doStack();
     flag_cron = true;
   }
 
-  if ( (minute() != 2) and (flag_cron == true)) {
+  if ( (hour() % cron_hours != 0) and (flag_cron == true)) {
+    stack_quota = 0;
     flag_cron = false;
   }
+
 }
 
 void doStack()
-{ 
-  Serial.print(F("Agent \"Stack\" called."));
-   
+{    
   if (strstr(nom_from, sms_whitelist[1])) {
-    ++stack_quota;
-    if (stack_quota > stack_quota_max) {
-      stack_quota = stack_quota_max;
-      return;
-    }   
+    ++stack_quota;  
   }
+  
+  if (stack_quota > stack_quota_max) {
+    stack_quota = stack_quota_max;
+  } 
+
+  doThing();
+  doSMS();
+
+  strcpy(agent, "stack");
+
 }
 
 boolean doListen()
@@ -1592,8 +1518,8 @@ boolean doListen()
     }
 
     // Action on the first text match.
-    if (match == true) { 
 
+    if (match) { 
       strcpy(agent, search_for);
 
       // Erase command from stream.  So we don't respond to it twice.
@@ -1609,51 +1535,52 @@ boolean doListen()
 
 void doRespond()
 {
-
+  boolean flag = false;
+  // Check if a whitelisted number has appeared.
   for (int i = 0; i < num_whitelist; i++) {
     if (strstr(agent,sms_whitelist[i])) {
       strcpy(nom_from, sms_whitelist[i]);
     }
   }
 
+  // Check if the stack number has appeared.
   if (strstr(nom_from,sms_whitelist[1])) {
     doStack();
   }
 
   if (strstr(agent,"ping")) {
     doPing();
+    flag = true;
   }
 
   if (strstr(agent,"weather")) {
     doWeather();
+    flag = true;
   }
   
   if (strstr(agent,"cockpit")) {
     doCockpit();
+    flag = true;
   }
 
   if (strstr(agent,"cabin")) {
     doCabin();
+    flag = true;
   }
 
   if (strstr(agent,"bilge")) {
     doBilge();
+    flag = true;
   }
   
   if (strstr(agent,"crow")) {
     doCrow();
+    flag = true;
   }
-/*  
-  if (strstr(agent,"pigeon")) {
-    doPigeon();
-  }
-
-  if (strstr(agent,"seagull")) {
-    doSeagull();
-  }
-*/  
+ 
   if (strstr(agent,"kaiju")) {
     doKaiju();
+    flag = true;
   }
   
   if (strstr(agent,"flag")) {
@@ -1662,15 +1589,29 @@ void doRespond()
   
   if (strstr(agent,"engine")) {
     doEngine();
+    flag = true;
   }
   
-/*  
+  if (strstr(agent,"thing")) {
+    doThing();
+    flag = true;
+  }
+  
   if (strstr(agent,"agents")) {
     doAgents();
+    flag = true;
   }
-*/
-
-
+  
+  if (strstr(agent,"uuid")) {
+    doUuid();
+    flag = true;
+  }
+  
+  if (strstr(agent,"heave")) {
+    doHeave();
+    flag = true;
+  }
+  
   if (strstr(agent,"+CMTI")) {
     doHayes();
   }
@@ -1684,7 +1625,6 @@ void doRespond()
   }
 
   strcpy(agent, "");
-
 }
 
 boolean doHear()
